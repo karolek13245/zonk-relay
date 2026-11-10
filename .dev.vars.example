@@ -1,0 +1,4 @@
+# The two secrets of your relay. Cloudflare asks for them when you press the Deploy button.
+# For local tests copy this file to .dev.vars (which git ignores) and fill it in. NEVER commit real values.
+HOST_TOKEN=
+API_KEY=

@@ -2,10 +2,20 @@
   "name": "zonk-relay",
   "main": "src/index.js",
   "compatibility_date": "2025-09-01",
+  // Makes fetch() go out to the public internet, so a public relay can tell the relay list about itself
+  // even when the list lives in the same Cloudflare account.
+  "compatibility_flags": ["global_fetch_strictly_public"],
   "durable_objects": {
     "bindings": [{ "name": "RELAY", "class_name": "Relay" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay"] }],
-  "vars": { "REQUEST_TIMEOUT_SECONDS": "120" },
+  "vars": {
+    "REQUEST_TIMEOUT_SECONDS": "120",
+    // "true": anyone can chat without an API key, and the relay is listed on the relay page.
+    // "false": private. Chatting needs the API key and the relay is not listed anywhere.
+    "PUBLIC_MODE": "false",
+    // Where a public relay announces itself. Set it to "" to never announce.
+    "DIRECTORY_URL": "https://zonk-relays.karol-zeczek2914.workers.dev"
+  },
   "observability": { "enabled": true }
 }

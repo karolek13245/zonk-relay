@@ -1,0 +1,12 @@
+{
+  "name": "zonk-relays",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  // Makes fetch() always go out to the public internet, so this Worker can check relays that live in the same Cloudflare account.
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "durable_objects": {
+    "bindings": [{ "name": "DIRECTORY", "class_name": "Directory" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Directory"] }],
+  "observability": { "enabled": true }
+}

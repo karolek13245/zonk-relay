@@ -1,12 +1,12 @@
 // Pretend phone for testing. Usage:
 //   node tools/fake-host.mjs wss://zonk-relay.<you>.workers.dev <HOST_TOKEN>
-// Needs Node 22+ (global WebSocket).
+// Needs Node 22+ (global WebSocket). The token is sent in the Authorization header, never in the address.
 const [base, token] = process.argv.slice(2);
 if (!base || !token) {
   console.log("usage: node tools/fake-host.mjs <wss://url> <HOST_TOKEN>");
   process.exit(1);
 }
-const ws = new WebSocket(`${base.replace(/\/$/, "")}/host?token=${encodeURIComponent(token)}`);
+const ws = new WebSocket(`${base.replace(/\/$/, "")}/host`, { headers: { Authorization: `Bearer ${token}` } });
 ws.onopen = () => {
   console.log("connected");
   ws.send(JSON.stringify({ type: "hello", model: "fake-model", name: "fake-phone" }));
