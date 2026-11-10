@@ -1,14 +1,26 @@
 {
   "name": "zonk-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "fake-host": "node tools/fake-host.mjs"
+    "setup": "node tools/setup.mjs",
+    "fake-host": "node tools/fake-host.mjs",
+    "test": "node --import ./test/register.mjs --test \"test/*.test.mjs\""
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "HOST_TOKEN": {
+        "description": "The password your phone uses to connect to this relay. Any random string of 16 or more characters. Make one with `openssl rand -hex 24` and keep it private: you paste it into the Zonk-Core app later."
+      },
+      "API_KEY": {
+        "description": "The password people use to chat through a private relay. Any random string of 16 or more characters, different from HOST_TOKEN. Make one with `openssl rand -hex 24`. A public relay does not ask for it, but fill it in anyway."
+      }
+    }
   }
 }

@@ -1,5 +1,20 @@
 import { DurableObject } from "cloudflare:workers";
+import {
+  MAX_BODY_BYTES,
+  RateLimiter,
+  SECURITY_HEADERS,
+  TooLarge,
+  VERSION,
+  announce,
+  bearer,
+  checkChatBody,
+  configProblem,
+  isPublic,
+  readTextLimited,
+  safeEqual,
+} from "./guards.js";
 
+// Any website may call the API, but it still needs the API key (sent in a header, never in a cookie).
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-headers": "authorization, content-type",
@@ -9,7 +24,7 @@ const CORS = {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json", ...CORS },
+    headers: { "content-type": "application/json", ...SECURITY_HEADERS, ...CORS },
   });
 }
 
@@ -17,22 +32,55 @@ function errorJson(status, message, type = "relay_error") {
   return json({ error: { message, type } }, status);
 }
 
-async function safeEqual(a, b) {
-  const enc = new TextEncoder();
-  const x = enc.encode(a || "");
-  const y = enc.encode(b || "");
-  if (x.length !== y.length || x.length === 0) return false;
-  return crypto.subtle.timingSafeEqual(x, y);
+function page(env) {
+  const mode = configProblem(env)
+    ? "Not set up yet: add the HOST_TOKEN secret (see the README)."
+    : isPublic(env)
+      ? "Public relay: anyone can chat through it, and it is listed on the relay page."
+      : "Private relay: chatting needs the API key.";
+  return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Zonk Relay</title><body style="font-family:system-ui;background:#0b0b0f;color:#eee;padding:2rem;line-height:1.5">
+<h1>Zonk Relay <small style="font-weight:400;color:#999">${VERSION}</small></h1>
+<p>Online. ${mode}</p>
+<p>Phones connect at <code>/host</code>, apps call <code>/v1/chat/completions</code>, and <code>/health</code> says whether a phone is ready.</p>
+</body>`;
 }
 
-function bearer(request) {
-  const h = request.headers.get("authorization") || "";
-  return h.startsWith("Bearer ") ? h.slice(7).trim() : "";
+const PAGE_HEADERS = {
+  "content-type": "text/html; charset=utf-8",
+  "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+  ...SECURITY_HEADERS,
+};
+
+// Which method each API path accepts.
+const API_METHODS = {
+  "/v1/models": "GET",
+  "/status": "GET",
+  "/v1/chat/completions": "POST",
+};
+
+/** What anyone may learn about the relay. A private relay only says that it exists. */
+async function health(request, env) {
+  const base = { service: "zonk-relay", version: VERSION, public: isPublic(env) };
+  if (configProblem(env)) return json({ ...base, public: false, ready: false });
+  if (!base.public) return json({ ...base, ready: true });
+  let info = { hosts: 0, models: [] };
+  try {
+    info = await (await env.RELAY.get(env.RELAY.idFromName("main")).fetch(request)).json();
+  } catch {
+    // The Durable Object is restarting: report that no phone is ready for now.
+  }
+  return json({ ...base, ready: true, hosts: info.hosts, models: info.models });
 }
 
-const PAGE = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Zonk Relay</title><body style="font-family:system-ui;background:#0b0b0f;color:#eee;padding:2rem">
-<h1>Zonk Relay</h1><p>Online. Phones connect at <code>/host</code>, apps call <code>/v1/chat/completions</code>.</p></body>`;
+/** A copy of the request that tells the Durable Object who is asking. Only this Worker sets these headers. */
+function withClientInfo(request, anonymous) {
+  const headers = new Headers(request.headers);
+  headers.delete("authorization");
+  headers.set("x-zonk-anon", anonymous ? "1" : "0");
+  headers.set("x-zonk-ip", request.headers.get("cf-connecting-ip") || "unknown");
+  return new Request(request, { headers });
+}
 
 export default {
   async fetch(request, env) {
@@ -40,27 +88,49 @@ export default {
     const path = url.pathname;
 
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-    if (path === "/") return new Response(PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
 
-    if (!env.API_KEY || !env.HOST_TOKEN) {
-      return errorJson(500, "Server is missing API_KEY / HOST_TOKEN secrets.", "config_error");
+    if (path === "/") {
+      if (request.method !== "GET" && request.method !== "HEAD") return errorJson(405, "Use GET.");
+      return new Response(page(env), { headers: PAGE_HEADERS });
+    }
+
+    if (path === "/health") {
+      if (request.method !== "GET" && request.method !== "HEAD") return errorJson(405, "Use GET.");
+      return health(request, env);
+    }
+
+    const problem = configProblem(env);
+    if (problem) {
+      // The reason goes to the log for the owner; callers only learn that the server is not set up.
+      console.error("zonk-relay is not configured: " + problem);
+      return errorJson(500, "Server is not configured.", "config_error");
     }
     const stub = env.RELAY.get(env.RELAY.idFromName("main"));
 
     if (path === "/host") {
-      if (request.headers.get("upgrade") !== "websocket") {
+      if (request.method !== "GET") return errorJson(405, "Use GET.");
+      if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") {
         return errorJson(426, "Expected a WebSocket connection.");
       }
-      const token = bearer(request) || url.searchParams.get("token") || "";
-      if (!(await safeEqual(token, env.HOST_TOKEN))) return errorJson(401, "Bad host token.", "auth_error");
+      // The token travels in the Authorization header only. A token in the address would end up in logs.
+      if (!(await safeEqual(bearer(request), env.HOST_TOKEN))) return errorJson(401, "Bad host token.", "auth_error");
       return stub.fetch(request);
     }
 
-    if (path === "/v1/models" || path === "/v1/chat/completions" || path === "/status") {
-      if (!(await safeEqual(bearer(request), env.API_KEY))) {
-        return errorJson(401, "Bad or missing API key.", "auth_error");
+    if (Object.hasOwn(API_METHODS, path)) {
+      const keyOk = await safeEqual(bearer(request), env.API_KEY);
+      // A public relay lets anyone chat without a key (but never read /status). Those callers are rate limited.
+      const anonymous = !keyOk && isPublic(env) && path !== "/status";
+      if (!keyOk && !anonymous) return errorJson(401, "Bad or missing API key.", "auth_error");
+      if (request.method !== API_METHODS[path]) return errorJson(405, `Use ${API_METHODS[path]}.`);
+      if (path === "/v1/chat/completions") {
+        // Turn away an oversized request before it reaches the Durable Object.
+        const declared = Number(request.headers.get("content-length"));
+        if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+          return errorJson(413, "Request is too large.", "invalid_request");
+        }
       }
-      return stub.fetch(request);
+      return stub.fetch(withClientInfo(request, anonymous));
     }
 
     return errorJson(404, "Not found.", "not_found");
@@ -69,6 +139,11 @@ export default {
 
 const MAX_QUEUE = 20;
 const MAX_HOSTS = 20;
+/** Without a key, one internet address may send this many chat requests a minute / an hour. */
+const ANON_PER_MINUTE = 20;
+const ANON_PER_HOUR = 200;
+/** A public relay tells the relay list about itself at most this often. */
+const ANNOUNCE_EVERY_MS = 6 * 60 * 60 * 1000;
 
 export class Relay extends DurableObject {
   constructor(ctx, env) {
@@ -76,7 +151,22 @@ export class Relay extends DurableObject {
     this.jobs = new Map(); // id -> job (only alive while a request is waiting)
     this.queue = []; // jobs waiting for a free phone
     this.busy = new Set(); // sockets currently working on a job
+    this.perMinute = new RateLimiter(ANON_PER_MINUTE, 60 * 1000);
+    this.perHour = new RateLimiter(ANON_PER_HOUR, 60 * 60 * 1000);
+    this.lastAnnounce = 0;
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+  }
+
+  /** A public relay on workers.dev tells the relay list that it exists. Never blocks or fails the request. */
+  maybeAnnounce(origin) {
+    const directory = String(this.env.DIRECTORY_URL ?? "").trim();
+    if (!isPublic(this.env) || !/^https:\/\//i.test(directory)) return;
+    if (!new URL(origin).hostname.endsWith(".workers.dev")) return;
+    const now = Date.now();
+    if (now - this.lastAnnounce < ANNOUNCE_EVERY_MS) return;
+    this.lastAnnounce = now;
+    const job = announce(directory, origin);
+    if (typeof this.ctx.waitUntil === "function") this.ctx.waitUntil(job);
   }
 
   timeoutMs() {
@@ -91,8 +181,16 @@ export class Relay extends DurableObject {
   async fetch(request) {
     const path = new URL(request.url).pathname;
 
+    if (path === "/health") {
+      this.maybeAnnounce(new URL(request.url).origin);
+      const hosts = this.hosts();
+      const models = [...new Set(hosts.map((ws) => ws.deserializeAttachment().model))].slice(0, 5);
+      return json({ hosts: hosts.length, models });
+    }
+
     if (path === "/host") {
       if (this.ctx.getWebSockets().length >= MAX_HOSTS) return errorJson(503, "Too many phones connected.");
+      this.maybeAnnounce(new URL(request.url).origin);
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
       pair[1].serializeAttachment({ ready: false });
@@ -124,21 +222,35 @@ export class Relay extends DurableObject {
   }
 
   async chat(request) {
-    let body;
+    if (request.headers.get("x-zonk-anon") === "1") {
+      const ip = request.headers.get("x-zonk-ip") || "unknown";
+      if (!this.perMinute.allow(ip) || !this.perHour.allow(ip)) {
+        return errorJson(429, "Too many requests from your address. Try again in a minute.", "rate_limited");
+      }
+    }
+    let text;
     try {
-      body = await request.json();
+      text = await readTextLimited(request);
+    } catch (e) {
+      if (e instanceof TooLarge) return errorJson(413, "Request is too large.", "invalid_request");
+      return errorJson(400, "Could not read the request.", "invalid_request");
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
     } catch {
       return errorJson(400, "Body must be JSON.", "invalid_request");
     }
-    if (!Array.isArray(body.messages) || body.messages.length === 0) {
-      return errorJson(400, "'messages' must be a non-empty array.", "invalid_request");
-    }
+    const checked = checkChatBody(parsed);
+    if (!checked.ok) return errorJson(400, checked.message, "invalid_request");
+    const { messages, options, model: wanted, stream } = checked.value;
+
     if (this.hosts().length === 0) return errorJson(503, "No phone is online right now.", "no_host");
     if (this.queue.length >= MAX_QUEUE) return errorJson(429, "Too many requests waiting.", "queue_full");
 
     let result;
     try {
-      result = await this.submit(body);
+      result = await this.submit({ messages, options, model: wanted });
     } catch (e) {
       const status = e.status || 502;
       return errorJson(status, e.message || "Relay failure.", e.kind || "relay_error");
@@ -146,14 +258,14 @@ export class Relay extends DurableObject {
 
     const created = Math.floor(Date.now() / 1000);
     const id = "chatcmpl-" + crypto.randomUUID();
-    const model = result.model || body.model || "zonk";
+    const model = result.model || wanted || "zonk";
     const usage = {
       prompt_tokens: result.promptTokens || 0,
       completion_tokens: result.completionTokens || 0,
       total_tokens: (result.promptTokens || 0) + (result.completionTokens || 0),
     };
 
-    if (body.stream) {
+    if (stream) {
       const chunk = (delta, finish) =>
         `data: ${JSON.stringify({
           id, object: "chat.completion.chunk", created, model,
@@ -164,7 +276,7 @@ export class Relay extends DurableObject {
         chunk({}, "stop") +
         "data: [DONE]\n\n";
       return new Response(sse, {
-        headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...CORS },
+        headers: { "content-type": "text/event-stream", ...SECURITY_HEADERS, ...CORS },
       });
     }
 
@@ -217,13 +329,13 @@ export class Relay extends DurableObject {
       job.ws = ws;
       job.attempts++;
       this.busy.add(ws);
-      const { messages, temperature, max_tokens, top_p } = job.body;
+      const { messages, options } = job.body;
       try {
         ws.send(JSON.stringify({
           type: "request",
           id: job.id,
           messages,
-          options: { temperature, max_tokens, top_p },
+          options,
         }));
       } catch {
         this.busy.delete(ws);
@@ -272,6 +384,7 @@ export class Relay extends DurableObject {
     if (typeof message !== "string") return;
     let msg;
     try { msg = JSON.parse(message); } catch { return; }
+    if (msg === null || typeof msg !== "object") return;
 
     if (msg.type === "hello") {
       ws.serializeAttachment({
@@ -297,7 +410,8 @@ export class Relay extends DurableObject {
       });
       this.drain();
     } else if (msg.type === "error") {
-      this.abort(job, Object.assign(new Error(String(msg.message || "Phone reported an error.")), { status: 502, kind: "host_error" }));
+      const why = String(msg.message || "Phone reported an error.").slice(0, 300);
+      this.abort(job, Object.assign(new Error(why), { status: 502, kind: "host_error" }));
     }
   }
 
